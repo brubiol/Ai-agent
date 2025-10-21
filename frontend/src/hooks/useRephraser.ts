@@ -29,10 +29,26 @@ export function useRephraser(initialStyles: WritingStyle[] = WRITING_STYLES) {
   const controllerRef = useRef<AbortController | null>(null);
   const canceledRef = useRef(false);
   const activeStylesRef = useRef<Set<WritingStyle>>(new Set());
+  const ignoreUpdatesRef = useRef(false);
 
-  const resetResults = useCallback(() => {
-    setResults(createInitialResults());
-  }, []);
+  const resetResults = useCallback(
+    (requestStyles: WritingStyle[]) => {
+      ignoreUpdatesRef.current = false;
+      setResults((prev) => {
+        const next: ResultsMap = { ...prev };
+        for (const style of WRITING_STYLES) {
+          if (requestStyles.includes(style)) {
+            next[style] = { text: '', done: false };
+          } else {
+            const previous = prev[style] ?? { text: '', done: true };
+            next[style] = { text: previous.text, done: true };
+          }
+        }
+        return next;
+      });
+    },
+    [],
+  );
 
   const clearController = useCallback(() => {
     const wasCanceled = canceledRef.current;
@@ -54,12 +70,13 @@ export function useRephraser(initialStyles: WritingStyle[] = WRITING_STYLES) {
 
       setError(null);
       setState('processing');
-      resetResults();
+      resetResults(requestStyles);
       activeStylesRef.current = new Set(requestStyles);
 
       try {
         const { results: data } = await requestRephrase({ text, styles: requestStyles }, controller.signal);
-        setResults((prev) => {
+      ignoreUpdatesRef.current = false;
+      setResults((prev) => {
           const next = createInitialResults();
           for (const style of WRITING_STYLES) {
             const textResult = data?.[style] ?? '';
@@ -97,7 +114,7 @@ export function useRephraser(initialStyles: WritingStyle[] = WRITING_STYLES) {
 
       setError(null);
       setState('streaming');
-      resetResults();
+      resetResults(requestStyles);
       activeStylesRef.current = new Set(requestStyles);
 
       try {
@@ -107,11 +124,20 @@ export function useRephraser(initialStyles: WritingStyle[] = WRITING_STYLES) {
             onChunk: ({ style, delta, done }) => {
               if (style) {
                 setResults((prev) => {
+                  if (ignoreUpdatesRef.current) {
+                    return prev;
+                  }
                   const current = prev[style] ?? { text: '', done: false };
+                  const nextDelta = delta ?? '';
+                  const needsSpace =
+                    current.text.length > 0 &&
+                    nextDelta.length > 0 &&
+                    !/^\s/.test(nextDelta) &&
+                    !/[ \n]$/.test(current.text);
                   return {
                     ...prev,
                     [style]: {
-                      text: current.text + (delta ?? ''),
+                      text: current.text + (needsSpace ? ` ${nextDelta}` : nextDelta),
                       done: done ?? current.done,
                     },
                   };
@@ -149,6 +175,7 @@ export function useRephraser(initialStyles: WritingStyle[] = WRITING_STYLES) {
   const cancel = useCallback(() => {
     if (controllerRef.current) {
       canceledRef.current = true;
+       ignoreUpdatesRef.current = true;
       controllerRef.current.abort();
       setState('canceled');
     }

@@ -68,7 +68,7 @@ class AnthropicProvider:
     async def rephrase_stream(self, text: str, style: str) -> AsyncIterator[str]:
         rewritten = await self.rephrase(text, style)
         for chunk in chunk_text(rewritten):
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.05)
             yield chunk
 
     def _build_payload(self, *, text: str, style: str) -> Dict[str, Any]:

@@ -8,9 +8,21 @@ interface InputPanelProps {
   selectedStyles: WritingStyle[];
   onToggleStyle: (style: WritingStyle) => void;
   disabled?: boolean;
+  charCount: number;
+  wordCount: number;
+  maxChars: number;
 }
 
-export function InputPanel({ text, onTextChange, selectedStyles, onToggleStyle, disabled = false }: InputPanelProps) {
+export function InputPanel({
+  text,
+  onTextChange,
+  selectedStyles,
+  onToggleStyle,
+  disabled = false,
+  charCount,
+  wordCount,
+  maxChars,
+}: InputPanelProps) {
   const handleTextChange = (event: ChangeEvent<HTMLTextAreaElement>) => {
     onTextChange(event.target.value);
   };
@@ -23,7 +35,9 @@ export function InputPanel({ text, onTextChange, selectedStyles, onToggleStyle, 
     <section className="panel input-panel" aria-labelledby="rephrase-input-heading">
       <div className="panel-header">
         <h2 id="rephrase-input-heading">Content</h2>
-        <span className="muted">{text.length} characters</span>
+        <span className={`muted counter${charCount > maxChars ? ' counter-alert' : ''}`}>
+          {wordCount} word{wordCount === 1 ? '' : 's'} · {charCount}/{maxChars} characters
+        </span>
       </div>
       <label className="sr-only" htmlFor="rephrase-text">
         Text to rephrase
@@ -36,6 +50,11 @@ export function InputPanel({ text, onTextChange, selectedStyles, onToggleStyle, 
         placeholder="Paste or type the message you want to rephrase..."
         rows={8}
       />
+      {charCount > maxChars ? (
+        <p className="input-warning" role="alert">
+          Trim the text by {charCount - maxChars} character{charCount - maxChars === 1 ? '' : 's'} to continue.
+        </p>
+      ) : null}
 
       <fieldset className="style-selector">
         <legend>Styles</legend>
@@ -57,4 +76,3 @@ export function InputPanel({ text, onTextChange, selectedStyles, onToggleStyle, 
     </section>
   );
 }
-

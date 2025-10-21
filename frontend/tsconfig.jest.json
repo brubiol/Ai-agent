@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "moduleResolution": "node",
+    "verbatimModuleSyntax": false,
+    "module": "ESNext",
+    "esModuleInterop": true,
+    "allowImportingTsExtensions": false,
+    "types": ["jest", "@testing-library/jest-dom"]
+  }
+}

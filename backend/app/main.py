@@ -2,16 +2,24 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import time
 import uuid
+from contextlib import suppress
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List
+from typing import Any, AsyncGenerator, Dict, List, Tuple, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.providers.anthropic_provider import AnthropicProvider
 from app.providers.base import (
@@ -26,13 +34,58 @@ from app.providers.base import (
 from app.providers.openai_provider import OpenAIProvider
 from app.task_manager import RequestTaskRegistry, provide_request_task_registry
 
+
+class BodySizeLimitMiddleware(BaseHTTPMiddleware):
+    """Reject requests whose body exceeds the configured size."""
+
+    def __init__(self, app: FastAPI, *, max_body_size: int) -> None:
+        super().__init__(app)
+        self.max_body_size = max_body_size
+
+    async def dispatch(self, request: Request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length:
+            with suppress(ValueError):
+                if int(content_length) > self.max_body_size:
+                    return JSONResponse(status_code=413, content={"detail": "Request body too large"})
+
+        body = await request.body()
+        if len(body) > self.max_body_size:
+            return JSONResponse(status_code=413, content={"detail": "Request body too large"})
+
+        async def receive() -> Dict[str, Any]:
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        request = Request(request.scope, receive)  # type: ignore[arg-type]
+        return await call_next(request)
+
+
+MAX_BODY_BYTES = 16_384
+QueueItem = Tuple[str, Any]
+limiter = Limiter(key_func=get_remote_address, default_limits=["30/minute"])
+
+
+def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    reset_time = getattr(exc, "reset_time", time.time())
+    retry_after = max(1, math.ceil(reset_time - time.time()))
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Too Many Requests"},
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
 app = FastAPI(title="Rephraser API")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+app.add_middleware(BodySizeLimitMiddleware, max_body_size=MAX_BODY_BYTES)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(SlowAPIMiddleware)
 
 
 class Settings(BaseSettings):
@@ -70,8 +123,8 @@ class HealthResponse(BaseModel):
 
 
 class RephraseRequest(BaseModel):
-    text: str = Field(..., min_length=1, max_length=4000)
-    styles: List[str] = Field(..., min_length=1)
+    text: str = Field(..., min_length=1, max_length=2000)
+    styles: List[str] = Field(..., min_length=1, max_length=4)
 
     @staticmethod
     def _allowed_styles() -> set[str]:
@@ -81,9 +134,13 @@ class RephraseRequest(BaseModel):
         """Reject any style that is not in the supported list."""
         allowed = self._allowed_styles()
         validated_styles: List[str] = []
+        seen = set()
         for style in self.styles:
             if style not in allowed:
                 raise ValueError(f"style must be one of {sorted(allowed)}")
+            if style in seen:
+                continue
+            seen.add(style)
             validated_styles.append(style)
         self.styles = validated_styles
 
@@ -147,9 +204,11 @@ def _handle_provider_error(exc: ProviderError) -> HTTPException:
     return HTTPException(status_code=502, detail="Upstream provider error")
 
 
+@limiter.limit("30/minute")
 @app.post("/rephrase", response_model=RephraseResponse)
 async def rephrase(
     payload: RephraseRequest,
+    request: Request,
     client: LLMClient = Depends(get_llm_client),
     tasks: RequestTaskRegistry = Depends(provide_request_task_registry),
 ) -> RephraseResponse:
@@ -182,6 +241,7 @@ def _sse_message(event: str, data: Dict[str, Any], *, event_id: str | None = Non
     return "\n".join(body) + "\n\n"
 
 
+@limiter.limit("30/minute")
 @app.post("/rephrase/stream")
 async def rephrase_stream(
     payload: RephraseRequest,
@@ -189,33 +249,62 @@ async def rephrase_stream(
     client: LLMClient = Depends(get_llm_client),
     tasks: RequestTaskRegistry = Depends(provide_request_task_registry),
 ) -> StreamingResponse:
-    async def event_stream() -> AsyncGenerator[str, None]:
-        await tasks.register_task(asyncio.current_task())
-        for style in payload.styles:
-            style_id = str(uuid.uuid4())
-            try:
-                async for chunk in client.rephrase_stream(payload.text, style):
-                    if await request.is_disconnected():
-                        return
-                    yield _sse_message(
-                        "chunk",
-                        {"style": style, "delta": chunk, "done": False},
-                        event_id=style_id,
-                    )
+    message_queue: asyncio.Queue[QueueItem] = asyncio.Queue()
+    total_styles = len(payload.styles)
+
+    async def stream_style(style: str) -> None:
+        style_id = str(uuid.uuid4())
+        try:
+            async for chunk in client.rephrase_stream(payload.text, style):
                 if await request.is_disconnected():
                     return
-                yield _sse_message(
-                    "chunk",
-                    {"style": style, "delta": "", "done": True},
-                    event_id=style_id,
+                await message_queue.put(
+                    (
+                        "data",
+                        _sse_message(
+                            "chunk",
+                            {"style": style, "delta": chunk, "done": False},
+                            event_id=style_id,
+                        ),
+                    )
                 )
-            except ProviderError as exc:
-                raise _handle_provider_error(exc) from exc
-            except asyncio.CancelledError:
-                # Disconnection triggered cancellation.
+            if await request.is_disconnected():
                 return
-        if not await request.is_disconnected():
-            yield _sse_message("done", {"done": True})
+            await message_queue.put(
+                (
+                    "data",
+                    _sse_message(
+                        "chunk",
+                        {"style": style, "delta": "", "done": True},
+                        event_id=style_id,
+                    ),
+                )
+            )
+        except ProviderError as exc:
+            await message_queue.put(("error", exc))
+        finally:
+            await message_queue.put(("complete", style))
+
+    for style in payload.styles:
+        await tasks.create_task(stream_style(style))
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        current = asyncio.current_task()
+        await tasks.register_task(current)
+        completed = 0
+        try:
+            while completed < total_styles:
+                kind, payload_item = await message_queue.get()
+                if kind == "data":
+                    yield cast(str, payload_item)
+                elif kind == "error":
+                    raise _handle_provider_error(cast(ProviderError, payload_item))
+                elif kind == "complete":
+                    completed += 1
+            if not await request.is_disconnected():
+                yield _sse_message("done", {"done": True})
+        finally:
+            await tasks.cancel_all(exclude={current} if current else None)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

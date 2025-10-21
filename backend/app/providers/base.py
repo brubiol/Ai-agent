@@ -36,10 +36,37 @@ class LLMClient(Protocol):
 
 
 def chunk_text(text: str, *, size: int = 32) -> list[str]:
-    # Return fixed-width slices so we can simulate incremental streaming.
+    """Return human-friendly chunks so streaming feels smoother."""
     if not text:
         return [""]
-    return [text[i : i + size] for i in range(0, len(text), size)]
+
+    words = text.split()
+    if not words:
+        return [text]
+
+    chunks: list[str] = []
+    buffer = ""
+
+    for word in words:
+        if len(word) > size:
+            if buffer:
+                chunks.append(buffer)
+                buffer = ""
+            for i in range(0, len(word), size):
+                chunks.append(word[i : i + size])
+            continue
+
+        candidate = f"{buffer} {word}".strip()
+        if buffer and len(candidate) > size:
+            chunks.append(buffer)
+            buffer = word
+        else:
+            buffer = candidate
+
+    if buffer:
+        chunks.append(buffer)
+
+    return chunks
 
 
 class MockLLMClient:
@@ -53,7 +80,7 @@ class MockLLMClient:
     async def rephrase_stream(self, text: str, style: str) -> AsyncIterator[str]:
         rewritten = await self.rephrase(text, style)
         for chunk in chunk_text(rewritten):
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.05)
             yield chunk
 
 
