@@ -3,12 +3,21 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any, Dict, List
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app.main import app
+from app.main import app, get_settings
+
+
+@pytest.fixture(autouse=True)
+def reset_settings(monkeypatch: pytest.MonkeyPatch):
+    for key in ("AUTH_BEARER_TOKEN", "ALLOWED_ORIGINS"):
+        monkeypatch.delenv(key, raising=False)
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 @pytest.fixture()
@@ -88,3 +97,22 @@ async def test_stream_cancellation_triggers_cleanup(client: AsyncClient, monkeyp
             await asyncio.wait_for(agen.__anext__(), timeout=0.2)
 
     async_mock.assert_awaited()
+
+
+@pytest.mark.anyio
+async def test_rephrase_requires_bearer_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AUTH_BEARER_TOKEN", "secret-token")
+    get_settings.cache_clear()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as secured_client:
+        payload = {"text": "Hello", "styles": ["professional"]}
+        unauthorized = await secured_client.post("/rephrase", json=payload)
+        assert unauthorized.status_code == 401
+
+        authorized = await secured_client.post(
+            "/rephrase",
+            json=payload,
+            headers={"Authorization": "Bearer secret-token"},
+        )
+        assert authorized.status_code == 200

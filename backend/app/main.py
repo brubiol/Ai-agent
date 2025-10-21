@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
+import secrets
 import time
 import uuid
+from contextvars import ContextVar
+from datetime import datetime
 from contextlib import suppress
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Tuple, cast
+from typing import Annotated, Any, AsyncGenerator, Dict, List, Tuple, cast
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -63,6 +67,8 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
 MAX_BODY_BYTES = 16_384
 QueueItem = Tuple[str, Any]
 limiter = Limiter(key_func=get_remote_address, default_limits=["30/minute"])
+request_id_ctx: ContextVar[str | None] = ContextVar("request_id", default=None)
+_LOGGING_CONFIGURED = False
 
 
 def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
@@ -75,17 +81,93 @@ def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSO
     )
 
 
+class JSONLogFormatter(logging.Formatter):
+    def __init__(self, *, secrets_to_redact: list[str]):
+        super().__init__()
+        self._secrets = [s for s in secrets_to_redact if s]
+
+    def _redact(self, value: Any) -> Any:
+        if isinstance(value, str):
+            redacted = value
+            for secret in self._secrets:
+                if secret and secret in redacted:
+                    redacted = redacted.replace(secret, "***")
+            return redacted
+        return value
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: Dict[str, Any] = {
+            "timestamp": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+            "level": record.levelname,
+            "logger": record.name,
+            "message": self._redact(record.getMessage()),
+        }
+        req_id = getattr(record, "request_id", None)
+        if req_id:
+            payload["request_id"] = req_id
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        for key, value in record.__dict__.items():
+            if key in {
+                "name",
+                "msg",
+                "args",
+                "levelname",
+                "levelno",
+                "pathname",
+                "filename",
+                "module",
+                "exc_info",
+                "exc_text",
+                "stack_info",
+                "lineno",
+                "funcName",
+                "created",
+                "msecs",
+                "relativeCreated",
+                "thread",
+                "threadName",
+                "processName",
+                "process",
+            }:
+                continue
+            if key not in payload and value is not None:
+                payload[key] = self._redact(value)
+        return json.dumps(payload, default=str)
+
+
+class RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = request_id_ctx.get()
+        return True
+
+
+def configure_logging(settings: Settings) -> None:
+    global _LOGGING_CONFIGURED
+    if _LOGGING_CONFIGURED:
+        return
+    secrets_to_redact = [
+        settings.openai_api_key or "",
+        settings.anthropic_api_key or "",
+        settings.auth_bearer_token or "",
+    ]
+    formatter = JSONLogFormatter(secrets_to_redact=secrets_to_redact)
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    handler.addFilter(RequestIdFilter())
+
+    for logger_name in ("uvicorn.access", "uvicorn.error", "app", "app.requests"):
+        logger = logging.getLogger(logger_name)
+        logger.handlers = [handler]
+        logger.propagate = False
+        logger.setLevel(logging.INFO)
+
+    _LOGGING_CONFIGURED = True
+
+
 app = FastAPI(title="Rephraser API")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
-app.add_middleware(BodySizeLimitMiddleware, max_body_size=MAX_BODY_BYTES)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-app.add_middleware(SlowAPIMiddleware)
 
 
 class Settings(BaseSettings):
@@ -102,6 +184,11 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
     default_provider: str = Field(default="auto")
     request_timeout_seconds: float = Field(default=10.0, gt=0)
+    allowed_origins_env: str | None = Field(default=None, validation_alias="ALLOWED_ORIGINS")
+    allowed_origins: List[str] = Field(
+        default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"]
+    )
+    auth_bearer_token: str | None = Field(default=None, validation_alias="AUTH_BEARER_TOKEN")
 
     @staticmethod
     def _is_empty(value: str | None) -> bool:
@@ -116,6 +203,16 @@ class Settings(BaseSettings):
             raise ValueError("OPENAI_API_KEY is required when default_provider=openai")
         if provider == "anthropic" and self._is_empty(self.anthropic_api_key):
             raise ValueError("ANTHROPIC_API_KEY is required when default_provider=anthropic")
+        if self.allowed_origins_env:
+            parsed = [
+                origin.strip()
+                for origin in self.allowed_origins_env.split(",")
+                if origin and origin.strip()
+            ]
+            if parsed:
+                self.allowed_origins = parsed
+        if not self.allowed_origins:
+            self.allowed_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
 
 class HealthResponse(BaseModel):
@@ -154,6 +251,7 @@ def get_settings() -> Settings:
     """Load settings once per process; FastAPI reuses this cached instance."""
     settings = Settings()
     settings.validate()
+    configure_logging(settings)
     return settings
 
 
@@ -178,6 +276,69 @@ def build_llm_client(settings: Settings) -> LLMClient:
 
     # No matching provider is configured; fall back to mock implementation.
     return MockLLMClient()
+
+
+def configure_app(app: FastAPI) -> None:
+    settings = get_settings()
+    app.add_middleware(BodySizeLimitMiddleware, max_body_size=MAX_BODY_BYTES)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.allowed_origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    app.add_middleware(SlowAPIMiddleware)
+
+
+request_logger = logging.getLogger("app.requests")
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    token = request_id_ctx.set(request_id)
+    start = time.perf_counter()
+    try:
+        request_logger.info(
+            "request.start",
+            extra={"method": request.method, "path": request.url.path},
+        )
+        response = await call_next(request)
+        duration_ms = (time.perf_counter() - start) * 1000
+        response.headers["X-Request-ID"] = request_id
+        request_logger.info(
+            "request.end",
+            extra={
+                "status_code": response.status_code,
+                "duration_ms": round(duration_ms, 2),
+            },
+        )
+        return response
+    except Exception:
+        request_logger.exception(
+            "request.error",
+            extra={"path": request.url.path, "method": request.method},
+        )
+        raise
+    finally:
+        request_id_ctx.reset(token)
+
+
+configure_app(app)
+
+
+def require_bearer_token(
+    authorization: Annotated[str | None, Header(default=None)],
+    settings: Settings = Depends(get_settings),
+) -> None:
+    expected = settings.auth_bearer_token
+    if expected is None:
+        return
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    provided = authorization.split(" ", 1)[1].strip()
+    if not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 def get_llm_client(settings: Settings = Depends(get_settings)) -> LLMClient:
@@ -209,6 +370,7 @@ def _handle_provider_error(exc: ProviderError) -> HTTPException:
 async def rephrase(
     payload: RephraseRequest,
     request: Request,
+    _: None = Depends(require_bearer_token),
     client: LLMClient = Depends(get_llm_client),
     tasks: RequestTaskRegistry = Depends(provide_request_task_registry),
 ) -> RephraseResponse:
@@ -246,6 +408,7 @@ def _sse_message(event: str, data: Dict[str, Any], *, event_id: str | None = Non
 async def rephrase_stream(
     payload: RephraseRequest,
     request: Request,
+    _: None = Depends(require_bearer_token),
     client: LLMClient = Depends(get_llm_client),
     tasks: RequestTaskRegistry = Depends(provide_request_task_registry),
 ) -> StreamingResponse:
