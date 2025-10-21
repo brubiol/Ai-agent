@@ -10,3 +10,4 @@ rephraser_backend.egg-info/requires.txt
 rephraser_backend.egg-info/top_level.txt
 tests/test_main.py
 tests/test_providers.py
+tests/test_streaming.py

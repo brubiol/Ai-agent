@@ -6,6 +6,7 @@ import httpx
 
 import asyncio
 
+from app.prompts import system_prompt_for_style
 from app.providers.base import (
     AuthenticationError,
     ProviderConfigError,
@@ -21,12 +22,22 @@ class OpenAIProvider:
 
     _API_URL = "https://api.openai.com/v1/chat/completions"
 
-    def __init__(self, api_key: str, *, model: str = "gpt-3.5-turbo", timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        model: str = "gpt-4o-mini",
+        timeout: float = 10.0,
+        temperature: float = 0.7,
+        max_tokens: int = 256,
+    ) -> None:
         if not api_key or not api_key.strip():
             raise ProviderConfigError("OPENAI_API_KEY is required for OpenAIProvider")
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
+        self.temperature = temperature
+        self.max_tokens = max_tokens
 
     async def rephrase(self, text: str, style: str) -> str:
         payload = self._build_payload(text=text, style=style)
@@ -59,19 +70,15 @@ class OpenAIProvider:
             yield chunk
 
     def _build_payload(self, *, text: str, style: str) -> Dict[str, Any]:
-        instructions = (
-            "You rephrase content. Respond with the rephrased text only, "
-            "no explanations or markdown. "
-            f"Rewrite the text using a {style} tone."
-        )
+        system_prompt = system_prompt_for_style(style)
         return {
             "model": self.model,
             "messages": [
-                # System prompt keeps the output format consistent regardless of input style.
-                {"role": "system", "content": instructions},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": text},
             ],
-            "temperature": 0.7,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
         }
 
     @staticmethod

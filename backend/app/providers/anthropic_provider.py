@@ -5,6 +5,7 @@ from typing import Any, AsyncIterator, Dict, List
 
 import httpx
 
+from app.prompts import system_prompt_for_style
 from app.providers.base import (
     AuthenticationError,
     ProviderConfigError,
@@ -27,6 +28,7 @@ class AnthropicProvider:
         model: str = "claude-3-haiku-20240307",
         timeout: float = 10.0,
         max_tokens: int = 512,
+        temperature: float = 0.7,
     ) -> None:
         if not api_key or not api_key.strip():
             raise ProviderConfigError("ANTHROPIC_API_KEY is required for AnthropicProvider")
@@ -34,6 +36,7 @@ class AnthropicProvider:
         self.model = model
         self.timeout = timeout
         self.max_tokens = max_tokens
+        self.temperature = temperature
 
     async def rephrase(self, text: str, style: str) -> str:
         payload = self._build_payload(text=text, style=style)
@@ -69,11 +72,7 @@ class AnthropicProvider:
             yield chunk
 
     def _build_payload(self, *, text: str, style: str) -> Dict[str, Any]:
-        system_prompt = (
-            "You are a writing assistant that rewrites user-provided text. "
-            "Return only the rewritten text, without explanations, "
-            "rewritten in the requested tone."
-        )
+        system_prompt = system_prompt_for_style(style)
         user_message: List[Dict[str, str]] = [
             {
                 "type": "text",
@@ -84,6 +83,7 @@ class AnthropicProvider:
             "model": self.model,
             "system": system_prompt,
             "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
             "messages": [
                 # Anthropic expects a list of blocks; we keep to plain text for simplicity.
                 {

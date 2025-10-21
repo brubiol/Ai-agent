@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from functools import lru_cache
@@ -23,6 +24,7 @@ from app.providers.base import (
     RateLimitError,
 )
 from app.providers.openai_provider import OpenAIProvider
+from app.task_manager import RequestTaskRegistry, provide_request_task_registry
 
 app = FastAPI(title="Rephraser API")
 app.add_middleware(
@@ -149,14 +151,22 @@ def _handle_provider_error(exc: ProviderError) -> HTTPException:
 async def rephrase(
     payload: RephraseRequest,
     client: LLMClient = Depends(get_llm_client),
+    tasks: RequestTaskRegistry = Depends(provide_request_task_registry),
 ) -> RephraseResponse:
     # We independently call the provider for each requested style so partial failures
     # map cleanly to HTTP errors without returning partial results.
     results: Dict[str, str] = {}
 
-    for style in payload.styles:
+    style_tasks = {
+        style: await tasks.create_task(client.rephrase(payload.text, style))
+        for style in payload.styles
+    }
+
+    for style, task in style_tasks.items():
         try:
-            rewritten = await client.rephrase(payload.text, style)
+            rewritten = await task
+        except asyncio.CancelledError as exc:
+            raise HTTPException(status_code=499, detail="Client cancelled the request") from exc
         except ProviderError as exc:
             raise _handle_provider_error(exc) from exc
         results[style] = rewritten
@@ -177,8 +187,10 @@ async def rephrase_stream(
     payload: RephraseRequest,
     request: Request,
     client: LLMClient = Depends(get_llm_client),
+    tasks: RequestTaskRegistry = Depends(provide_request_task_registry),
 ) -> StreamingResponse:
     async def event_stream() -> AsyncGenerator[str, None]:
+        await tasks.register_task(asyncio.current_task())
         for style in payload.styles:
             style_id = str(uuid.uuid4())
             try:
@@ -199,6 +211,9 @@ async def rephrase_stream(
                 )
             except ProviderError as exc:
                 raise _handle_provider_error(exc) from exc
+            except asyncio.CancelledError:
+                # Disconnection triggered cancellation.
+                return
         if not await request.is_disconnected():
             yield _sse_message("done", {"done": True})
 
