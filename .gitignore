@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+.env
+.env.*
+*.log
+
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+.coverage
+dist/
+build/
+
+# Node
+node_modules/
+dist/
+.vite/
