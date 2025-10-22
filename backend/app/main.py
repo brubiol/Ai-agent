@@ -328,7 +328,7 @@ configure_app(app)
 
 
 def require_bearer_token(
-    authorization: Annotated[str | None, Header(default=None)],
+    authorization: Annotated[str | None, Header()] = None,
     settings: Settings = Depends(get_settings),
 ) -> None:
     expected = settings.auth_bearer_token

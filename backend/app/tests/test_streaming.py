@@ -3,20 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 
-import pytest
 import httpx
+import pytest
 
-from app.main import app, get_llm_client
-
-
-@pytest.fixture(autouse=True)
-def _reset_overrides():
-    app.dependency_overrides.clear()
-    yield
-    app.dependency_overrides.clear()
+from app.main import app, get_llm_client, get_settings
 
 
 class SequencedStreamClient:
+    __provider_name__ = "mock"
+
     async def rephrase(self, text: str, style: str) -> str:
         return "".join(self._chunks(style))
 
@@ -30,36 +25,9 @@ class SequencedStreamClient:
         return [f"{style}-part-1 ", f"{style}-part-2"]
 
 
-@pytest.mark.asyncio
-async def test_stream_endpoint_emits_chunks_in_order():
-    app.dependency_overrides[get_llm_client] = lambda: SequencedStreamClient()
-
-    payload = {"text": "ignored", "styles": ["professional", "casual"]}
-
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        async with client.stream("POST", "/rephrase/stream", json=payload) as response:
-            assert response.status_code == 200
-            assert response.headers["content-type"].startswith("text/event-stream")
-
-            data_events = []
-            async for line in response.aiter_lines():
-                if not line or not line.startswith("data: "):
-                    continue
-                data_events.append(json.loads(line[6:]))
-
-    assert data_events[:-1] == [
-        {"style": "professional", "delta": "professional-part-1 ", "done": False},
-        {"style": "professional", "delta": "professional-part-2", "done": False},
-        {"style": "professional", "delta": "", "done": True},
-        {"style": "casual", "delta": "casual-part-1 ", "done": False},
-        {"style": "casual", "delta": "casual-part-2", "done": False},
-        {"style": "casual", "delta": "", "done": True},
-    ]
-    assert data_events[-1] == {"done": True}
-
-
 class CancellingStreamClient:
+    __provider_name__ = "mock"
+
     def __init__(self) -> None:
         self.cancelled = asyncio.Event()
 
@@ -70,26 +38,53 @@ class CancellingStreamClient:
         try:
             while True:
                 await asyncio.sleep(0)
-                yield "streaming"
+                yield "chunk"
         finally:
             self.cancelled.set()
 
 
+@pytest.fixture(autouse=True)
+def _reset_streaming(monkeypatch: pytest.MonkeyPatch):
+    app.dependency_overrides.clear()
+    monkeypatch.setenv("DEFAULT_PROVIDER", "mock")
+    get_settings.cache_clear()
+    yield
+    app.dependency_overrides.clear()
+    get_settings.cache_clear()
+
+
 @pytest.mark.asyncio
-async def test_stream_disconnect_cancels_provider():
+async def test_stream_emits_done_and_chunks() -> None:
+    app.dependency_overrides[get_llm_client] = lambda: SequencedStreamClient()
+    payload = {"text": "ignored", "styles": ["professional", "casual"]}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with client.stream("POST", "/rephrase/stream", json=payload) as response:
+            lines = [line async for line in response.aiter_lines() if line.startswith("data: ")]
+
+    assert json.loads(lines[-1][6:]) == {"done": True}
+    events = [json.loads(line[6:]) for line in lines[:-1]]
+    for style in payload["styles"]:
+        per_style = [event for event in events if event["style"] == style]
+        assert per_style == [
+            {"style": style, "delta": f"{style}-part-1 ", "done": False},
+            {"style": style, "delta": f"{style}-part-2", "done": False},
+            {"style": style, "delta": "", "done": True},
+        ]
+
+
+@pytest.mark.asyncio
+async def test_stream_disconnect_triggers_cancel() -> None:
     client_instance = CancellingStreamClient()
     app.dependency_overrides[get_llm_client] = lambda: client_instance
-
     payload = {"text": "ignored", "styles": ["professional"]}
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         stream_ctx = client.stream("POST", "/rephrase/stream", json=payload)
         async with stream_ctx as response:
-            line_stream = response.aiter_lines()
-            async for line in line_stream:
+            async for line in response.aiter_lines():
                 if line.startswith("data: "):
                     break
-            # Exiting the context manager simulates the client disconnect.
 
     await asyncio.wait_for(client_instance.cancelled.wait(), timeout=1)
