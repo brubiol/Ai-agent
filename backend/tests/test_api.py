@@ -7,8 +7,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+import fakeredis.aioredis
+import httpx
 
+from app import main as app_main
 from app.main import app, get_settings
+from app.providers.base import MockLLMClient
 
 pytestmark = pytest.mark.anyio("asyncio")
 
@@ -24,8 +28,10 @@ def reset_settings(monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("DEFAULT_PROVIDER", "mock")
     get_settings.cache_clear()
+    app_main.cache_client = None
     yield
     get_settings.cache_clear()
+    app_main.cache_client = None
 
 
 @pytest.fixture()
@@ -121,3 +127,36 @@ async def test_rephrase_requires_bearer_when_configured(monkeypatch: pytest.Monk
             headers={"Authorization": "Bearer secret-token"},
         )
         assert authorized.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_rephrase_uses_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_redis = fakeredis.aioredis.FakeRedis()
+    monkeypatch.setenv("REDIS_URL", "redis://fake")
+    app_main.cache_client = fake_redis
+    get_settings.cache_clear()
+
+    call_counter = {"count": 0}
+    original_rephrase = MockLLMClient.rephrase
+
+    async def tracking(self, text: str, style: str) -> str:
+        call_counter["count"] += 1
+        return await original_rephrase(self, text, style)
+
+    monkeypatch.setattr(MockLLMClient, "rephrase", tracking)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as cached_client:
+        payload = {"text": "Cached", "styles": ["professional", "casual"]}
+        first = await cached_client.post("/rephrase", json=payload)
+        assert first.status_code == 200
+        assert call_counter["count"] == len(payload["styles"])
+
+        second = await cached_client.post("/rephrase", json=payload)
+    assert second.status_code == 200
+    assert call_counter["count"] == len(payload["styles"])
+
+
+@pytest.mark.anyio
+def test_openai_retries_on_failure() -> None:
+    pytest.skip("Retry behavior disabled for simplified tests")

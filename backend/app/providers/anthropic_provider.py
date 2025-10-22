@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from typing import Any, AsyncIterator, Dict, List
 
 import httpx
@@ -29,6 +30,9 @@ class AnthropicProvider:
         timeout: float = 10.0,
         max_tokens: int = 512,
         temperature: float = 0.7,
+        max_retries: int = 3,
+        retry_base_delay: float = 0.2,
+        retry_jitter: float = 0.1,
     ) -> None:
         if not api_key or not api_key.strip():
             raise ProviderConfigError("ANTHROPIC_API_KEY is required for AnthropicProvider")
@@ -37,6 +41,9 @@ class AnthropicProvider:
         self.timeout = timeout
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.max_retries = max_retries
+        self.retry_base_delay = retry_base_delay
+        self.retry_jitter = retry_jitter
 
     async def rephrase(self, text: str, style: str) -> str:
         payload = self._build_payload(text=text, style=style)
@@ -45,25 +52,47 @@ class AnthropicProvider:
             "anthropic-version": "2023-06-01",
         }
 
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                # Align Anthropic error handling with our shared ProviderError hierarchy.
-                response = await client.post(self._API_URL, headers=headers, json=payload)
-                response.raise_for_status()
-        except httpx.TimeoutException as exc:
-            raise ProviderTimeoutError("Anthropic request timed out") from exc
-        except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code
-            if status == 429:
-                raise RateLimitError("Anthropic rate limit encountered") from exc
-            if status in {401, 403}:
-                raise AuthenticationError("Anthropic rejected the API key") from exc
-            raise ProviderError(f"Anthropic returned an unexpected status {status}") from exc
-        except httpx.RequestError as exc:
-            raise ProviderError("Anthropic request failed") from exc
+        delay = self.retry_base_delay
+        attempt = 0
+        last_error: Exception | None = None
+        while attempt < self.max_retries:
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    response = await client.post(self._API_URL, headers=headers, json=payload)
+                    response.raise_for_status()
+                data = response.json()
+                return self._extract_text(data)
+            except httpx.TimeoutException as exc:
+                err = ProviderTimeoutError("Anthropic request timed out")
+                err.__cause__ = exc
+                last_error = err
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status == 429:
+                    err = RateLimitError("Anthropic rate limit encountered")
+                    err.__cause__ = exc
+                    last_error = err
+                elif status in {401, 403}:
+                    raise AuthenticationError("Anthropic rejected the API key") from exc
+                elif status >= 500:
+                    err = ProviderError(f"Anthropic returned an unexpected status {status}")
+                    err.__cause__ = exc
+                    last_error = err
+                else:
+                    raise ProviderError(f"Anthropic returned an unexpected status {status}") from exc
+            except httpx.RequestError as exc:
+                err = ProviderError("Anthropic request failed")
+                err.__cause__ = exc
+                last_error = err
 
-        data = response.json()
-        return self._extract_text(data)
+            attempt += 1
+            if attempt >= self.max_retries:
+                break
+            await asyncio.sleep(delay + random.uniform(0, self.retry_jitter))
+            delay *= 2
+
+        assert last_error is not None
+        raise last_error
 
     async def rephrase_stream(self, text: str, style: str) -> AsyncIterator[str]:
         rewritten = await self.rephrase(text, style)

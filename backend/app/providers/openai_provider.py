@@ -5,6 +5,7 @@ from typing import Any, AsyncIterator, Dict
 import httpx
 
 import asyncio
+import random
 
 from app.prompts import system_prompt_for_style
 from app.providers.base import (
@@ -30,6 +31,9 @@ class OpenAIProvider:
         timeout: float = 10.0,
         temperature: float = 0.7,
         max_tokens: int = 256,
+        max_retries: int = 3,
+        retry_base_delay: float = 0.2,
+        retry_jitter: float = 0.1,
     ) -> None:
         if not api_key or not api_key.strip():
             raise ProviderConfigError("OPENAI_API_KEY is required for OpenAIProvider")
@@ -38,30 +42,54 @@ class OpenAIProvider:
         self.timeout = timeout
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.max_retries = max_retries
+        self.retry_base_delay = retry_base_delay
+        self.retry_jitter = retry_jitter
 
     async def rephrase(self, text: str, style: str) -> str:
         payload = self._build_payload(text=text, style=style)
         headers = {"Authorization": f"Bearer {self.api_key}"}
+        delay = self.retry_base_delay
+        attempt = 0
+        last_error: Exception | None = None
+        while attempt < self.max_retries:
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    response = await client.post(self._API_URL, json=payload, headers=headers)
+                    response.raise_for_status()
+                data = response.json()
+                return self._extract_text(data)
+            except httpx.TimeoutException as exc:
+                err = ProviderTimeoutError("OpenAI request timed out")
+                err.__cause__ = exc
+                last_error = err
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status == 429:
+                    err = RateLimitError("OpenAI rate limit encountered")
+                    err.__cause__ = exc
+                    last_error = err
+                elif status in {401, 403}:
+                    raise AuthenticationError("OpenAI rejected the API key") from exc
+                elif status >= 500:
+                    err = ProviderError(f"OpenAI returned an unexpected status {status}")
+                    err.__cause__ = exc
+                    last_error = err
+                else:
+                    raise ProviderError(f"OpenAI returned an unexpected status {status}") from exc
+            except httpx.RequestError as exc:
+                err = ProviderError("OpenAI request failed")
+                err.__cause__ = exc
+                last_error = err
 
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                # We rely on httpx to raise for non-2xx so we can normalize the errors below.
-                response = await client.post(self._API_URL, json=payload, headers=headers)
-                response.raise_for_status()
-        except httpx.TimeoutException as exc:
-            raise ProviderTimeoutError("OpenAI request timed out") from exc
-        except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code
-            if status == 429:
-                raise RateLimitError("OpenAI rate limit encountered") from exc
-            if status in {401, 403}:
-                raise AuthenticationError("OpenAI rejected the API key") from exc
-            raise ProviderError(f"OpenAI returned an unexpected status {status}") from exc
-        except httpx.RequestError as exc:
-            raise ProviderError("OpenAI request failed") from exc
+            attempt += 1
+            if attempt >= self.max_retries:
+                break
+            await asyncio.sleep(delay + random.uniform(0, self.retry_jitter))
+            delay *= 2
 
-        data = response.json()
-        return self._extract_text(data)
+        assert last_error is not None
+        raise last_error
 
     async def rephrase_stream(self, text: str, style: str) -> AsyncIterator[str]:
         rewritten = await self.rephrase(text, style)

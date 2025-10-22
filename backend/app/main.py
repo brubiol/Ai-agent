@@ -4,21 +4,24 @@ import asyncio
 import json
 import logging
 import math
+import random
 import secrets
 import time
 import uuid
+import hashlib
 from contextvars import ContextVar
 from datetime import datetime
 from contextlib import suppress
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Any, AsyncGenerator, Dict, List, Tuple, cast
+from typing import Annotated, Any, AsyncGenerator, Dict, List, Tuple, cast, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from redis.asyncio import Redis
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -67,6 +70,7 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
 MAX_BODY_BYTES = 16_384
 QueueItem = Tuple[str, Any]
 limiter = Limiter(key_func=get_remote_address, default_limits=["30/minute"])
+cache_client: Redis | None = None
 request_id_ctx: ContextVar[str | None] = ContextVar("request_id", default=None)
 _LOGGING_CONFIGURED = False
 
@@ -189,6 +193,8 @@ class Settings(BaseSettings):
         default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"]
     )
     auth_bearer_token: str | None = Field(default=None, validation_alias="AUTH_BEARER_TOKEN")
+    redis_url: str | None = Field(default=None, validation_alias="REDIS_URL")
+    cache_ttl_seconds: int = Field(default=600, ge=1)
 
     @staticmethod
     def _is_empty(value: str | None) -> bool:
@@ -219,9 +225,13 @@ class HealthResponse(BaseModel):
     status: str = "ok"
 
 
+ProviderOverride = Literal["openai", "anthropic"]
+
+
 class RephraseRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=2000)
     styles: List[str] = Field(..., min_length=1, max_length=4)
+    provider: ProviderOverride | None = None
 
     @staticmethod
     def _allowed_styles() -> set[str]:
@@ -240,6 +250,8 @@ class RephraseRequest(BaseModel):
             seen.add(style)
             validated_styles.append(style)
         self.styles = validated_styles
+        if self.provider:
+            self.provider = cast(ProviderOverride, self.provider.lower())
 
 
 class RephraseResponse(BaseModel):
@@ -255,27 +267,59 @@ def get_settings() -> Settings:
     return settings
 
 
-def build_llm_client(settings: Settings) -> LLMClient:
-    """Pick the most suitable provider implementation based on configuration."""
-    provider_choice = settings.default_provider.lower()
+def resolve_client(settings: Settings, provider_override: str | None = None) -> Tuple[LLMClient, str]:
+    """Instantiate a provider client and return it alongside its identifier."""
+    provider_choice = (provider_override or settings.default_provider).lower()
+
+    def attach(client: LLMClient, name: str) -> Tuple[LLMClient, str]:
+        setattr(client, "__provider_name__", name)
+        return client, name
+
+    if provider_choice == "openai":
+        if settings.openai_api_key:
+            return attach(
+                OpenAIProvider(
+                    api_key=settings.openai_api_key,
+                    timeout=settings.request_timeout_seconds,
+                ),
+                "openai",
+            )
+        raise HTTPException(status_code=400, detail="OPENAI provider unavailable")
+
+    if provider_choice == "anthropic":
+        if settings.anthropic_api_key:
+            return attach(
+                AnthropicProvider(
+                    api_key=settings.anthropic_api_key,
+                    timeout=settings.request_timeout_seconds,
+                ),
+                "anthropic",
+            )
+        raise HTTPException(status_code=400, detail="ANTHROPIC provider unavailable")
 
     if provider_choice == "mock":
-        return MockLLMClient()
+        return attach(MockLLMClient(), "mock")
 
-    if provider_choice in {"openai", "auto"} and settings.openai_api_key:
-        return OpenAIProvider(
-            api_key=settings.openai_api_key,
-            timeout=settings.request_timeout_seconds,
-        )
+    if provider_choice == "auto":
+        if settings.openai_api_key:
+            return attach(
+                OpenAIProvider(
+                    api_key=settings.openai_api_key,
+                    timeout=settings.request_timeout_seconds,
+                ),
+                "openai",
+            )
+        if settings.anthropic_api_key:
+            return attach(
+                AnthropicProvider(
+                    api_key=settings.anthropic_api_key,
+                    timeout=settings.request_timeout_seconds,
+                ),
+                "anthropic",
+            )
+        return attach(MockLLMClient(), "mock")
 
-    if provider_choice in {"anthropic", "auto"} and settings.anthropic_api_key:
-        return AnthropicProvider(
-            api_key=settings.anthropic_api_key,
-            timeout=settings.request_timeout_seconds,
-        )
-
-    # No matching provider is configured; fall back to mock implementation.
-    return MockLLMClient()
+    return attach(MockLLMClient(), "mock")
 
 
 def configure_app(app: FastAPI) -> None:
@@ -341,9 +385,56 @@ def require_bearer_token(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def get_cache_client(settings: Settings) -> Redis | None:
+    global cache_client
+    if settings.redis_url is None:
+        return None
+    if cache_client is not None:
+        try:
+            if cache_client.closed:
+                cache_client = None
+        except AttributeError:
+            pass
+    if cache_client is None:
+        cache_client = Redis.from_url(
+            settings.redis_url,
+            encoding="utf-8",
+            decode_responses=True,
+        )
+    return cache_client
+
+
+def _cache_key(provider: str, text: str, styles: List[str]) -> str:
+    styles_part = ",".join(sorted(styles))
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return f"rephrase:{provider}:{styles_part}:{digest}"
+
+
+async def _read_cache(redis_client: Redis | None, key: str) -> Dict[str, str] | None:
+    if redis_client is None:
+        return None
+    cached = await redis_client.get(key)
+    if not cached:
+        return None
+    try:
+        data = json.loads(cached)
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items()}
+    except json.JSONDecodeError:
+        return None
+    return None
+
+
+async def _write_cache(redis_client: Redis | None, key: str, value: Dict[str, str], ttl: int) -> None:
+    if redis_client is None:
+        return
+    await redis_client.set(key, json.dumps(value), ex=ttl)
+
+
 def get_llm_client(settings: Settings = Depends(get_settings)) -> LLMClient:
     try:
-        return build_llm_client(settings)
+        client, _ = resolve_client(settings)
+        return client
     except ValueError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except ProviderConfigError as exc:
@@ -371,9 +462,22 @@ async def rephrase(
     payload: RephraseRequest,
     request: Request,
     _: None = Depends(require_bearer_token),
-    client: LLMClient = Depends(get_llm_client),
+    client_dep: LLMClient = Depends(get_llm_client),
+    settings: Settings = Depends(get_settings),
     tasks: RequestTaskRegistry = Depends(provide_request_task_registry),
 ) -> RephraseResponse:
+    client = client_dep
+    provider_used = getattr(client, "__provider_name__", settings.default_provider.lower())
+    if payload.provider:
+        client, provider_used = resolve_client(settings, payload.provider)
+    cache = get_cache_client(settings)
+    cache_key = None
+    if cache:
+        cache_key = _cache_key(provider_used, payload.text, payload.styles)
+        cached = await _read_cache(cache, cache_key)
+        if cached is not None:
+            return RephraseResponse(results=cached)
+
     # We independently call the provider for each requested style so partial failures
     # map cleanly to HTTP errors without returning partial results.
     results: Dict[str, str] = {}
@@ -392,6 +496,9 @@ async def rephrase(
             raise _handle_provider_error(exc) from exc
         results[style] = rewritten
 
+    if cache and cache_key:
+        await _write_cache(cache, cache_key, results, settings.cache_ttl_seconds)
+
     return RephraseResponse(results=results)
 
 
@@ -409,18 +516,44 @@ async def rephrase_stream(
     payload: RephraseRequest,
     request: Request,
     _: None = Depends(require_bearer_token),
-    client: LLMClient = Depends(get_llm_client),
+    client_dep: LLMClient = Depends(get_llm_client),
+    settings: Settings = Depends(get_settings),
     tasks: RequestTaskRegistry = Depends(provide_request_task_registry),
 ) -> StreamingResponse:
+    client = client_dep
+    provider_used = getattr(client, "__provider_name__", settings.default_provider.lower())
+    if payload.provider:
+        client, provider_used = resolve_client(settings, payload.provider)
+    cache = get_cache_client(settings)
+    cache_key = None
+    if cache:
+        cache_key = _cache_key(provider_used, payload.text, payload.styles)
+        cached = await _read_cache(cache, cache_key)
+        if cached is not None:
+            async def cached_stream() -> AsyncGenerator[str, None]:
+                for style in payload.styles:
+                    style_id = str(uuid.uuid4())
+                    yield _sse_message(
+                        "chunk",
+                        {"style": style, "delta": cached.get(style, ""), "done": True},
+                        event_id=style_id,
+                    )
+                yield _sse_message("done", {"done": True})
+
+            return StreamingResponse(cached_stream(), media_type="text/event-stream")
+
     message_queue: asyncio.Queue[QueueItem] = asyncio.Queue()
     total_styles = len(payload.styles)
+    collected: Dict[str, str] = {}
 
     async def stream_style(style: str) -> None:
         style_id = str(uuid.uuid4())
+        buffer: List[str] = []
         try:
             async for chunk in client.rephrase_stream(payload.text, style):
                 if await request.is_disconnected():
                     return
+                buffer.append(chunk)
                 await message_queue.put(
                     (
                         "data",
@@ -433,6 +566,7 @@ async def rephrase_stream(
                 )
             if await request.is_disconnected():
                 return
+            collected[style] = "".join(buffer)
             await message_queue.put(
                 (
                     "data",
@@ -441,8 +575,8 @@ async def rephrase_stream(
                         {"style": style, "delta": "", "done": True},
                         event_id=style_id,
                     ),
+                    )
                 )
-            )
         except ProviderError as exc:
             await message_queue.put(("error", exc))
         finally:
@@ -466,6 +600,8 @@ async def rephrase_stream(
                     completed += 1
             if not await request.is_disconnected():
                 yield _sse_message("done", {"done": True})
+            if cache and cache_key and len(collected) == total_styles:
+                await _write_cache(cache, cache_key, collected, settings.cache_ttl_seconds)
         finally:
             await tasks.cancel_all(exclude={current} if current else None)
 
