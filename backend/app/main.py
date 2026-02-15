@@ -195,7 +195,9 @@ class Settings(BaseSettings):
     request_timeout_seconds: float = Field(default=10.0, gt=0)
     allowed_origins_env: str | None = Field(default=None, validation_alias="ALLOWED_ORIGINS")
     allowed_origins: List[str] = Field(
-        default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"]
+        default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"],
+        # Avoid Settings reading ALLOWED_ORIGINS into this List[str] directly.
+        validation_alias="ALLOWED_ORIGINS_JSON",
     )
     auth_bearer_token: str | None = Field(default=None, validation_alias="AUTH_BEARER_TOKEN")
     redis_url: str | None = Field(default=None, validation_alias="REDIS_URL")

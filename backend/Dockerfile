@@ -11,13 +11,13 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy application source (includes pyproject.toml)
-COPY app /app
+COPY app /app/app
 
 RUN set -eux; \
     pip install --no-cache-dir --upgrade pip; \
     python - <<'PY' > /tmp/requirements.txt
 import tomllib
-with open('/app/pyproject.toml', 'rb') as fh:
+with open('/app/app/pyproject.toml', 'rb') as fh:
     project = tomllib.load(fh)['project']
 for dep in project.get('dependencies', []):
     print(dep)
@@ -25,10 +25,10 @@ PY
 
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-RUN rm -rf /app/tests /app/rephraser_backend.egg-info
+RUN rm -rf /app/app/tests /app/app/rephraser_backend.egg-info
 RUN addgroup --system app && adduser --system --ingroup app app
 USER app
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
