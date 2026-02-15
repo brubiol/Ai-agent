@@ -187,6 +187,7 @@ class Settings(BaseSettings):
         extra="ignore",
         env_file=str(Path(__file__).resolve().parents[2] / ".env"),
         env_file_encoding="utf-8",
+        env_ignore_empty=True,
     )
 
     openai_api_key: str | None = Field(default=None, validation_alias="OPENAI_API_KEY")
