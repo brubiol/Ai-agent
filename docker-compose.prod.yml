@@ -1,0 +1,26 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - DEFAULT_PROVIDER=${DEFAULT_PROVIDER:-auto}
+      - AUTH_BEARER_TOKEN=${AUTH_BEARER_TOKEN:-}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped

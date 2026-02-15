@@ -1,0 +1,21 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Frontend: Vite",
+      "type": "pwa-chrome",
+      "request": "launch",
+      "url": "http://localhost:5173",
+      "webRoot": "${workspaceFolder}/frontend"
+    },
+    {
+      "name": "Backend: FastAPI",
+      "type": "python",
+      "request": "launch",
+      "python": "${workspaceFolder}/backend/.venv/bin/python",
+      "module": "uvicorn",
+      "args": ["app.main:app", "--reload"],
+      "cwd": "${workspaceFolder}/backend"
+    }
+  ]
+}

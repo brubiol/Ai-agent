@@ -22,17 +22,20 @@ class TaskManager:
         self._lock = asyncio.Lock()
 
     async def register_task(self, request_id: str, task: TaskType) -> None:
+        # Keep a per-request task set so we can cancel all of them on disconnect.
         async with self._lock:
             tasks = self._tasks.setdefault(request_id, set())
             tasks.add(task)
         task.add_done_callback(lambda finished: asyncio.create_task(self._discard(request_id, finished)))
 
     async def create_task(self, request_id: str, coro: Coroutine[Any, Any, Any]) -> TaskType:
+        # Wrapper that ensures new tasks are tracked for this request.
         task = asyncio.create_task(coro)
         await self.register_task(request_id, task)
         return task
 
     async def cancel_all(self, request_id: str, *, exclude: Optional[Set[TaskType]] = None) -> None:
+        # Cancel every still-running task for a request (except any exclusions).
         exclude = exclude or set()
         async with self._lock:
             tasks = list(self._tasks.get(request_id, set()))
@@ -62,6 +65,7 @@ class TaskManager:
             while True:
                 if await request.is_disconnected():
                     logger.info("Client disconnect detected for request %s", request_id)
+                    # Stop all work if the client is gone to avoid wasted provider calls.
                     await self.cancel_all(request_id, exclude={current} if current else None)
                     break
                 await asyncio.sleep(poll_interval)
@@ -84,6 +88,7 @@ class RequestTaskRegistry:
     request_id: str
 
     async def create_task(self, coro: Coroutine[Any, Any, Any]) -> TaskType:
+        # Convenience wrapper so handlers don't pass request_id everywhere.
         return await self.manager.create_task(self.request_id, coro)
 
     async def register_task(self, task: Optional[TaskType]) -> None:
@@ -104,9 +109,11 @@ task_manager = TaskManager()
 async def provide_request_task_registry(request: Request) -> AsyncIterator[RequestTaskRegistry]:
     """FastAPI dependency yielding the per-request task registry."""
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    # Attach the request id so other middleware/logging can use it.
     request.state.request_id = request_id
 
     registry = RequestTaskRegistry(manager=task_manager, request_id=request_id)
+    # Background watcher cancels provider work if the client disconnects.
     disconnect_task = await registry.create_task(
         task_manager.watch_disconnect(request_id, request),
     )
@@ -114,6 +121,7 @@ async def provide_request_task_registry(request: Request) -> AsyncIterator[Reque
     try:
         yield registry
     finally:
+        # Ensure everything is cleaned up even if the handler errors out.
         await registry.cancel_all(exclude={disconnect_task})
         disconnect_task.cancel()
         with suppress(asyncio.CancelledError):

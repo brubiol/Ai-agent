@@ -42,6 +42,7 @@ from app.providers.openai_provider import OpenAIProvider
 from app.task_manager import RequestTaskRegistry, provide_request_task_registry
 
 
+# Core request guardrail for payload size to avoid abuse/accidental large bodies.
 class BodySizeLimitMiddleware(BaseHTTPMiddleware):
     """Reject requests whose body exceeds the configured size."""
 
@@ -67,6 +68,7 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+# App-level knobs and shared state used across requests.
 MAX_BODY_BYTES = 16_384
 QueueItem = Tuple[str, Any]
 limiter = Limiter(key_func=get_remote_address, default_limits=["30/minute"])
@@ -75,6 +77,7 @@ request_id_ctx: ContextVar[str | None] = ContextVar("request_id", default=None)
 _LOGGING_CONFIGURED = False
 
 
+# Standardized response for SlowAPI rate limiting.
 def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
     reset_time = getattr(exc, "reset_time", time.time())
     retry_after = max(1, math.ceil(reset_time - time.time()))
@@ -146,6 +149,7 @@ class RequestIdFilter(logging.Filter):
         return True
 
 
+# Configure JSON logging once (shared across all requests).
 def configure_logging(settings: Settings) -> None:
     global _LOGGING_CONFIGURED
     if _LOGGING_CONFIGURED:
@@ -174,6 +178,7 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
 
 
+# Centralized runtime configuration (env vars, defaults, validation).
 class Settings(BaseSettings):
     """Runtime configuration loaded from environment variables."""
 
@@ -322,6 +327,7 @@ def resolve_client(settings: Settings, provider_override: str | None = None) -> 
     return attach(MockLLMClient(), "mock")
 
 
+# One-time app setup: limits, CORS allowlist, and rate-limiting middleware.
 def configure_app(app: FastAPI) -> None:
     settings = get_settings()
     app.add_middleware(BodySizeLimitMiddleware, max_body_size=MAX_BODY_BYTES)
@@ -337,6 +343,7 @@ def configure_app(app: FastAPI) -> None:
 request_logger = logging.getLogger("app.requests")
 
 
+# Request-scoped logging with request IDs and latency timing.
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
@@ -375,6 +382,7 @@ def require_bearer_token(
     authorization: Annotated[str | None, Header()] = None,
     settings: Settings = Depends(get_settings),
 ) -> None:
+    # Optional auth: enforce when AUTH_BEARER_TOKEN is configured.
     expected = settings.auth_bearer_token
     if expected is None:
         return
@@ -386,6 +394,7 @@ def require_bearer_token(
 
 
 def get_cache_client(settings: Settings) -> Redis | None:
+    # Redis is optional; return None to disable caching cleanly.
     global cache_client
     if settings.redis_url is None:
         return None
@@ -419,6 +428,7 @@ async def _read_cache(redis_client: Redis | None, key: str) -> Dict[str, str] | 
     try:
         data = json.loads(cached)
         if isinstance(data, dict):
+            # Breakpoint: cache hit path (cached payload parsed successfully).
             return {str(k): str(v) for k, v in data.items()}
     except json.JSONDecodeError:
         return None
@@ -428,6 +438,7 @@ async def _read_cache(redis_client: Redis | None, key: str) -> Dict[str, str] | 
 async def _write_cache(redis_client: Redis | None, key: str, value: Dict[str, str], ttl: int) -> None:
     if redis_client is None:
         return
+    # Breakpoint: cache write path (value will be stored in Redis).
     await redis_client.set(key, json.dumps(value), ex=ttl)
 
 
@@ -466,6 +477,7 @@ async def rephrase(
     settings: Settings = Depends(get_settings),
     tasks: RequestTaskRegistry = Depends(provide_request_task_registry),
 ) -> RephraseResponse:
+    # Breakpoint: entry to /rephrase after dependencies resolve.
     client = client_dep
     provider_used = getattr(client, "__provider_name__", settings.default_provider.lower())
     if payload.provider:
@@ -476,6 +488,7 @@ async def rephrase(
         cache_key = _cache_key(provider_used, payload.text, payload.styles)
         cached = await _read_cache(cache, cache_key)
         if cached is not None:
+            # Breakpoint: /rephrase cache hit returning immediately.
             return RephraseResponse(results=cached)
 
     # We independently call the provider for each requested style so partial failures
@@ -497,12 +510,14 @@ async def rephrase(
         results[style] = rewritten
 
     if cache and cache_key:
+        # Breakpoint: /rephrase cache write after all styles complete.
         await _write_cache(cache, cache_key, results, settings.cache_ttl_seconds)
 
     return RephraseResponse(results=results)
 
 
 def _sse_message(event: str, data: Dict[str, Any], *, event_id: str | None = None) -> str:
+    # Lightweight SSE formatter for streaming responses.
     body = [f"event: {event}"]
     if event_id is not None:
         body.append(f"id: {event_id}")
@@ -520,6 +535,7 @@ async def rephrase_stream(
     settings: Settings = Depends(get_settings),
     tasks: RequestTaskRegistry = Depends(provide_request_task_registry),
 ) -> StreamingResponse:
+    # Breakpoint: entry to /rephrase/stream after dependencies resolve.
     client = client_dep
     provider_used = getattr(client, "__provider_name__", settings.default_provider.lower())
     if payload.provider:
@@ -530,6 +546,7 @@ async def rephrase_stream(
         cache_key = _cache_key(provider_used, payload.text, payload.styles)
         cached = await _read_cache(cache, cache_key)
         if cached is not None:
+            # Breakpoint: /rephrase/stream cache hit, stream cached results.
             async def cached_stream() -> AsyncGenerator[str, None]:
                 for style in payload.styles:
                     style_id = str(uuid.uuid4())
@@ -593,6 +610,7 @@ async def rephrase_stream(
             while completed < total_styles:
                 kind, payload_item = await message_queue.get()
                 if kind == "data":
+                    # Breakpoint: streaming chunk about to be sent to the client.
                     yield cast(str, payload_item)
                 elif kind == "error":
                     raise _handle_provider_error(cast(ProviderError, payload_item))
@@ -601,6 +619,7 @@ async def rephrase_stream(
             if not await request.is_disconnected():
                 yield _sse_message("done", {"done": True})
             if cache and cache_key and len(collected) == total_styles:
+                # Breakpoint: /rephrase/stream cache write after all styles complete.
                 await _write_cache(cache, cache_key, collected, settings.cache_ttl_seconds)
         finally:
             await tasks.cancel_all(exclude={current} if current else None)
