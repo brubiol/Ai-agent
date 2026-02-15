@@ -201,6 +201,7 @@ class Settings(BaseSettings):
         validation_alias="ALLOWED_ORIGINS_JSON",
     )
     auth_bearer_token: str | None = Field(default=None, validation_alias="AUTH_BEARER_TOKEN")
+    auth_disabled: bool = Field(default=False, validation_alias="AUTH_DISABLED")
     redis_url: str | None = Field(default=None, validation_alias="REDIS_URL")
     cache_ttl_seconds: int = Field(default=600, ge=1)
 
@@ -386,6 +387,8 @@ def require_bearer_token(
     settings: Settings = Depends(get_settings),
 ) -> None:
     # Optional auth: enforce when AUTH_BEARER_TOKEN is configured.
+    if settings.auth_disabled:
+        return
     expected = settings.auth_bearer_token
     if expected is None:
         return
